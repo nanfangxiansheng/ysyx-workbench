@@ -1,0 +1,32 @@
+// IDU.v - Instruction Decode Unit
+module IDU (
+    input  [31:0] inst,
+    output [6:0]  opcode,
+    output [4:0]  rd,
+    output [2:0]  funct3,
+    output [4:0]  rs1,
+    output [4:0]  rs2,
+    output [6:0]  funct7,
+    output [31:0] imm_i,
+    output [31:0] imm_u,
+    output [31:0] imm_s
+);
+    
+    // 指令字段提取
+    assign opcode = inst[6:0];
+    assign rd     = inst[11:7];
+    assign funct3 = inst[14:12];
+    assign rs1    = inst[19:15];
+    assign rs2    = inst[24:20];
+    assign funct7 = inst[31:25];
+    
+    // I-type立即数（带符号扩展）
+    assign imm_i = {{20{inst[31]}}, inst[31:20]};
+    
+    // U-type立即数（lui）
+    assign imm_u = {inst[31:12], 12'b0};//本身imm_u就是左移动12位后的结果
+    
+    // S-type立即数（带符号扩展）
+    assign imm_s = {{20{inst[31]}}, inst[31:25], inst[11:7]};
+    
+endmodule

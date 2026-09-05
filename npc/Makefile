@@ -4,7 +4,7 @@ OBJ_DIR   = $(NPC_HOME)/build
 BIN       = $(OBJ_DIR)/$(NAME)
 
 # top module of your design
-VTOP      ?= example
+VTOP      ?= NPC
 
 # Verilator
 VERILATOR = verilator

@@ -12,3 +12,6 @@
 !init.sh
 /nvboard
 /fceux-am
+!/npc/**
+/npc/build/**
+/npc/.claude/
