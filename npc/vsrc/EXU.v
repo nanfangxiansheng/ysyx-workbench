@@ -1,10 +1,11 @@
-// EXU.v - Execution Unit (支持 addi, jalr, add, lui, lw, lbu, sw, sb)
+// EXU.v - Execution Unit (支持 addi, jalr, jal, add, lui, auipc, lw, lbu, sw, sb)
 module EXU (
     input  [31:0] rs1_data,
     input  [31:0] rs2_data,
     input  [31:0] imm_i,
     input  [31:0] imm_u,
     input  [31:0] imm_s,
+    input  [31:0] imm_j,
     input  [31:0] pc,
     input  [6:0]  opcode,
     input  [2:0]  funct3,
@@ -72,6 +73,14 @@ module EXU (
                 is_jalr = 1'b0;
                 pc_sel = 1'b0;
             end
+
+            7'b0010111: begin  // auipc 指令: rd = pc + (imm << 12)
+                result = pc + imm_u;  // imm_u已经是左移12位后的结果
+                waddr = rd;
+                wen = (rd != 0);
+                is_jalr = 1'b0;
+                pc_sel = 1'b0;
+            end
             
             7'b0000011: begin  // 加载指令 (lw, lbu)
                 is_load = 1'b1;
@@ -112,6 +121,18 @@ module EXU (
                 waddr = rd;
                 wen = (rd != 0);
                 is_jalr = 1'b1;
+                pc_sel = 1'b1;
+                is_load = 1'b0;
+                is_store = 1'b0;
+                mem_wen = 1'b0;
+            end
+
+            7'b1101111: begin  // jal 指令: rd = pc + 4, 跳转到 pc + imm_j
+                target_pc = pc + imm_j;
+                result = pc + 4;
+                waddr = rd;
+                wen = (rd != 0);
+                is_jalr = 1'b0;
                 pc_sel = 1'b1;
                 is_load = 1'b0;
                 is_store = 1'b0;

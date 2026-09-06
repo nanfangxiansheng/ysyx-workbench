@@ -29,9 +29,13 @@ $(BIN): $(VSRC) $(CSRC)
 	$(MAKE) -C $(VM_DIR) -f V$(VTOP).mk
 	@cp $(VM_BIN) $(BIN)
 
+# 运行仿真时加载的镜像文件, 例如:
+#   make sim IMG=$(YSYX_HOME)/am-kernels/tests/cpu-tests/build/dummy-riscv32-nemu.bin
+IMG ?=
+
 sim: $(BIN)
 	$(call git_commit, "sim RTL") # DO NOT REMOVE THIS LINE!!!
-	@$(BIN)
+	@$(BIN) $(IMG)
 
 clean:
 	rm -rf $(OBJ_DIR)

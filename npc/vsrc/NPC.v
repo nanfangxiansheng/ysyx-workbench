@@ -11,8 +11,8 @@ module NPC (
     // ============================================
     import "DPI-C" function int  pmem_read(input int raddr);
     import "DPI-C" function void pmem_write(input int waddr, input int wdata, input byte wmask);
-    // NPC执行ebreak时, 通过该函数通知仿真环境结束仿真
-    import "DPI-C" function void ebreak();
+    // NPC执行ebreak时, 通过该函数通知仿真环境结束仿真 (顺便把PC告诉C++侧)
+    import "DPI-C" function void ebreak(input int pc);
 
     // PC寄存器
     reg  [31:0] pc;
@@ -31,6 +31,7 @@ module NPC (
     wire [31:0] imm_i;
     wire [31:0] imm_u;
     wire [31:0] imm_s;
+    wire [31:0] imm_j;
 
     // 执行阶段
     wire [4:0]  reg_waddr;
@@ -60,7 +61,7 @@ module NPC (
     // ============================================
     always @(posedge clk or posedge rst) begin
         if (rst) begin
-            pc <= 32'h00000000;
+            pc <= 32'h8000_0000; // AM程序链接在0x80000000处, 复位后从这里开始执行
         end else begin
             pc <= pc_next;
         end
@@ -81,7 +82,7 @@ module NPC (
     // ebreak: 程序执行到ebreak时, 通过DPI-C通知
     // 仿真环境结束仿真 (ebreak编码见RISC-V手册)
     // ============================================
-    wire is_ebreak = (inst == 32'h00100073);
+    wire is_ebreak = (inst == 32'h00100073);//ebreak对应的指令编码
 
     reg ebreak_printed;
     initial begin
@@ -91,7 +92,7 @@ module NPC (
     always @(*) begin
         if (is_ebreak && !ebreak_printed) begin
             ebreak_printed = 1'b1;
-            ebreak();  // 通知C++仿真环境结束仿真
+            ebreak(pc);  // 通知C++仿真环境结束仿真
             $display("\n========================================");
             $display("NPC: 遇到ebreak指令, 仿真结束!");
             $display("最终寄存器状态:");
@@ -115,7 +116,8 @@ module NPC (
         .funct7  (funct7),
         .imm_i   (imm_i),
         .imm_u   (imm_u),
-        .imm_s   (imm_s)
+        .imm_s   (imm_s),
+        .imm_j   (imm_j)
     );
 
     // 2. 寄存器文件 (Register File)
@@ -140,6 +142,7 @@ module NPC (
         .imm_i     (imm_i),
         .imm_u     (imm_u),
         .imm_s     (imm_s),
+        .imm_j     (imm_j),
         .pc        (pc),
         .opcode    (opcode),
         .funct3    (funct3),
@@ -213,6 +216,7 @@ module NPC (
             cycle_count <= cycle_count + 1;
             $display("----------------------------------------");
             $display("Cycle %0d: PC = 0x%08X, inst = 0x%08X", cycle_count, pc, inst);
+            regfile.print_regs();
 
             if (is_load) begin
                 $display("  *** LOAD: addr = 0x%08X, funct3 = %b", mem_addr, mem_funct3);
