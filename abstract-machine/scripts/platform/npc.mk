@@ -25,7 +25,14 @@ image: image-dep
 	@echo + OBJCOPY "->" $(IMAGE_REL).bin
 	@$(OBJCOPY) -S --set-section-flags .bss=alloc,contents -O binary $(IMAGE).elf $(IMAGE).bin
 
-run: insert-arg
-	echo "TODO: add command here to run simulation"
+# NPC仿真环境的源码目录: 优先使用环境变量NPC_HOME,
+# 未设置时默认取abstract-machine同级的npc/
+NPC_HOME ?= $(abspath $(AM_HOME)/../npc)
+ifeq ($(NPC_HOME),)
+NPC_HOME := $(abspath $(AM_HOME)/../npc)
+endif
 
-.PHONY: insert-arg
+run: insert-arg
+	$(MAKE) -C $(NPC_HOME) run IMG=$(IMAGE).bin ARGS="$(mainargs)"
+
+.PHONY: insert-arg run

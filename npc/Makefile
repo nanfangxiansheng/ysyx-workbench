@@ -19,7 +19,7 @@ VFLAGS    = --cc --exe \
 VSRC = $(shell find $(NPC_HOME)/vsrc -name "*.v")
 CSRC = $(shell find $(NPC_HOME)/csrc -name "*.c" -o -name "*.cpp" -o -name "*.cc")
 
-.PHONY: all sim clean
+.PHONY: all sim run clean
 
 all: $(BIN)
 
@@ -36,6 +36,9 @@ IMG ?=
 sim: $(BIN)
 	$(call git_commit, "sim RTL") # DO NOT REMOVE THIS LINE!!!
 	@$(BIN) $(IMG)
+
+# AM的批量测试通过 run 目标启动仿真 (make ARCH=riscv32-npc ALL=dummy run)
+run: sim
 
 clean:
 	rm -rf $(OBJ_DIR)

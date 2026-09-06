@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <verilated.h>
+#include "svdpi.h"
 #include "VNPC.h"
 
 // AM 程序链接在 0x80000000 处, 物理内存从这一地址开始编址 (类似 NEMU 的 MBASE)
@@ -79,6 +80,9 @@ extern "C" void ebreak(int pc) {
   halt_flag = true;
   halt_pc = (uint32_t)pc;
 }
+
+// 读取NPC寄存器堆的值 (RegisterFile.v 中通过 DPI-C export 导出)
+extern "C" int get_reg(int raddr);
 
 // ==================== 仿真框架 ====================
 
@@ -153,25 +157,36 @@ int main(int argc, char **argv) {
   load_img(argc, argv);
 
   top = new VNPC;
+
+  // C++侧直接调用DPI export函数(get_reg)前, 必须把作用域
+  // 设置到该函数所在的寄存器堆实例, Verilator才能找到它
+  svScope scope = svGetScopeFromName("TOP.NPC.regfile");
+  assert(scope != nullptr); // 层次路径不对时这里会失败
+  svSetScope(scope);
+
   reset(10);
-  int cycle_count=0;
 
   // 不停地进行仿真, 直到程序执行 ebreak 指令为止
   uint64_t cycles = 0;
   while (!halt_flag) {
     single_cycle();
     cycles++;
-    cycle_count++;
-    if (cycle_count>100){
-      break;
-  }
   }
 
+  printf("NPC: hit ebreak at PC = 0x%08x, 共执行 %llu 个周期\n", halt_pc,
+         (unsigned long long)cycles);
 
-  printf("NPC: hit ebreak at PC = 0x%08x, 共执行 %llu 个周期, 仿真结束\n",
-         halt_pc, (unsigned long long)cycles);
+  // 约定: 程序在执行ebreak前把结束状态写入a0(x10)
+  // 0表示程序正确结束, 非0表示程序发生错误
+  int code = get_reg(10);
+  if (code == 0) {
+    printf("NPC: HIT GOOD TRAP (a0 = 0, 程序正确结束)\n");
+  } else {
+    printf("NPC: HIT BAD TRAP at PC = 0x%08x (a0 = %d, 程序发生错误)\n",
+           halt_pc, code);
+  }
 
   top->final();
   delete top;
-  return 0;
+  return code; // 把结束状态作为仿真进程的退出码, 便于脚本判断
 }

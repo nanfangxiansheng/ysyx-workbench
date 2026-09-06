@@ -15,7 +15,7 @@ void putch(char ch) {
 }
 
 void halt(int code) {
-  asm volatile("ebreak");
+  asm volatile("mv a0, %0; ebreak" : :"r"(code)); // 结束状态放入a0, 供仿真环境检查
   while (1);
 }
 

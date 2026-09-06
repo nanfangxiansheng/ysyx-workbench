@@ -27,6 +27,16 @@ module RegisterFile #(
     assign rdata2 = (raddr2 == 0) ? 32'b0 : rf[raddr2];
     
     // ============================================
+    // DPI-C导出: 供C++仿真环境读取寄存器的值
+    // 例如: NPC执行ebreak后, C++侧通过get_reg(10)
+    // 检查a0中程序的结束状态 (0=正确, 非0=出错)
+    // ============================================
+    export "DPI-C" function get_reg;
+    function int get_reg(input int raddr);
+        get_reg = rf[raddr[4:0]];
+    endfunction
+
+    // ============================================
     // 调试函数：打印寄存器状态
     // ============================================
     task print_regs;
