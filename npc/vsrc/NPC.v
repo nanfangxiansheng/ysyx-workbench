@@ -32,6 +32,7 @@ module NPC (
     wire [31:0] imm_u;
     wire [31:0] imm_s;
     wire [31:0] imm_j;
+    wire [31:0] imm_b;
 
     // 执行阶段
     wire [4:0]  reg_waddr;
@@ -79,6 +80,14 @@ module NPC (
     end
 
     // ============================================
+    // DPI-C导出: C++侧读取当前PC (DiffTest逐条对比用)
+    // ============================================
+    export "DPI-C" function get_pc;
+    function int get_pc();
+        get_pc = pc;
+    endfunction
+
+    // ============================================
     // ebreak: 程序执行到ebreak时, 通过DPI-C通知
     // 仿真环境结束仿真 (ebreak编码见RISC-V手册)
     // ============================================
@@ -117,7 +126,8 @@ module NPC (
         .imm_i   (imm_i),
         .imm_u   (imm_u),
         .imm_s   (imm_s),
-        .imm_j   (imm_j)
+        .imm_j   (imm_j),
+        .imm_b   (imm_b)
     );
 
     // 2. 寄存器文件 (Register File)
@@ -143,6 +153,7 @@ module NPC (
         .imm_u     (imm_u),
         .imm_s     (imm_s),
         .imm_j     (imm_j),
+        .imm_b     (imm_b),
         .pc        (pc),
         .opcode    (opcode),
         .funct3    (funct3),
@@ -174,12 +185,18 @@ module NPC (
 
     // ============================================
     // 数据访存: 存储器由C++实现, 通过DPI-C访问
+    // 读是纯组合的; 写必须放在时钟沿触发!
+    // 若放在组合逻辑里, Verilator在clk=1的eval中更新PC后
+    // 会用新指令重新稳定组合逻辑, 导致下一条store的写
+    // "提前"一拍发出, 破坏store/load的时序可见性
     // ============================================
     always @(*) begin
         // 写掩码: wmask中每比特对应wdata中1个字节
+        // 存储器按字节编址, 从mem_addr起连续写入, 天然支持非对齐访问
         case (mem_funct3)
-            3'b010:  wmask = 4'b1111;                  // sw - 写入4字节
-            3'b000:  wmask = 4'b0001 << mem_addr[1:0]; // sb - 只写1个字节
+            3'b010:  wmask = 4'b1111; // sw - 写入4字节
+            3'b001:  wmask = 4'b0011; // sh - 写入2字节
+            3'b000:  wmask = 4'b0001; // sb - 只写1个字节
             default: wmask = 4'b1111;
         endcase
 
@@ -188,8 +205,11 @@ module NPC (
         end else begin
             mem_rdata = 0;
         end
+    end
 
-        if (is_store) begin
+    // 存储器写: 时钟沿触发, 与真实硬件的同步写行为一致
+    always @(posedge clk) begin
+        if (!rst && is_store) begin
             pmem_write(mem_addr, mem_wdata, wmask);
         end
     end
@@ -214,20 +234,20 @@ module NPC (
     always @(posedge clk) begin
         if (!rst) begin
             cycle_count <= cycle_count + 1;
-            $display("----------------------------------------");
-            $display("Cycle %0d: PC = 0x%08X, inst = 0x%08X", cycle_count, pc, inst);
-            regfile.print_regs();
+            // $display("----------------------------------------");
+            // $display("Cycle %0d: PC = 0x%08X, inst = 0x%08X", cycle_count, pc, inst);
+            // //regfile.print_regs();
 
-            if (is_load) begin
-                $display("  *** LOAD: addr = 0x%08X, funct3 = %b", mem_addr, mem_funct3);
-            end
-            if (is_store) begin
-                $display("  *** STORE: addr = 0x%08X, data = 0x%08X, wmask = %b",
-                         mem_addr, mem_wdata, wmask);
-            end
-            if (is_jalr) begin
-                $display("  *** JALR: 跳转到 0x%08X", target_pc);
-            end
+            // if (is_load) begin
+            //     $display("  *** LOAD: addr = 0x%08X, funct3 = %b", mem_addr, mem_funct3);
+            // end
+            // if (is_store) begin
+            //     $display("  *** STORE: addr = 0x%08X, data = 0x%08X, wmask = %b",
+            //              mem_addr, mem_wdata, wmask);
+            // end
+            // if (is_jalr) begin
+            //     $display("  *** JALR: 跳转到 0x%08X", target_pc);
+            // end
         end
     end
 

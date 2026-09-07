@@ -16,3 +16,4 @@
 /npc/build/**
 /npc/.claude/
 /riscv-tests
+/archbench

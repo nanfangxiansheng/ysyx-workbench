@@ -1,4 +1,4 @@
-// EXU.v - Execution Unit (支持 addi, jalr, jal, add, lui, auipc, lw, lbu, sw, sb)
+// EXU.v - Execution Unit (支持 addi, jalr, jal, beq/bne, add, M扩展乘除法, lui, auipc, lw, lbu, sw, sb)
 module EXU (
     input  [31:0] rs1_data,
     input  [31:0] rs2_data,
@@ -6,6 +6,7 @@ module EXU (
     input  [31:0] imm_u,
     input  [31:0] imm_s,
     input  [31:0] imm_j,
+    input  [31:0] imm_b,
     input  [31:0] pc,
     input  [6:0]  opcode,
     input  [2:0]  funct3,
@@ -26,7 +27,34 @@ module EXU (
     output reg [31:0] mem_wdata,
     output reg        mem_wen
 );
-    
+
+    // ============================================
+    // M扩展(乘除法)的中间结果
+    // 乘法: 把32位操作数先扩展成64位, 乘积的低/高32位分别对应mul/mulh
+    // 除法: 必须先挡住除零和INT_MIN/-1溢出, 否则Verilator生成的
+    //       C++代码在仿真时会真的发生除零错误
+    // ============================================
+    wire [63:0] a_sgn = {{32{rs1_data[31]}}, rs1_data}; // 符号扩展
+    wire [63:0] b_sgn = {{32{rs2_data[31]}}, rs2_data};
+    wire [63:0] a_uns = {32'b0, rs1_data};              // 零扩展
+    wire [63:0] b_uns = {32'b0, rs2_data};
+    wire [63:0] prod_ss = a_sgn * b_sgn;                // 有符号×有符号
+    wire [63:0] prod_su = a_sgn * $signed(b_uns);       // 有符号×无符号(b_uns按位表示的值即其符号值)
+    wire [63:0] prod_uu = a_uns * b_uns;                // 无符号×无符号
+
+    wire        div_by_zero = (rs2_data == 32'b0);
+    wire        div_ovf     = (rs1_data == 32'h80000000) && (rs2_data == 32'hFFFFFFFF); // INT_MIN / -1
+    wire signed [31:0] a_s32 = $signed(rs1_data);
+    wire signed [31:0] b_s32 = $signed(rs2_data);
+    wire signed [31:0] quo_s  = (b_s32 == 0)        ? 32'sd0 :
+                                div_ovf             ? -32'sd2147483648 : a_s32 / b_s32;
+    wire signed [31:0] rem_s  = (b_s32 == 0)        ? a_s32 :
+                                div_ovf             ? 32'sd0           : a_s32 % b_s32;
+    wire [31:0] quo_u = div_by_zero ? 32'hFFFFFFFF : rs1_data / rs2_data;
+    wire [31:0] rem_u = div_by_zero ? rs1_data     : rs1_data % rs2_data;
+
+    reg br_taken; // 分支条件是否成立
+
     // ============================================
     // 组合逻辑：根据 opcode 执行不同指令
     // ============================================
@@ -46,23 +74,67 @@ module EXU (
         mem_wen = 1'b0;
         
         case (opcode)
-            7'b0010011: begin  // addi 指令
-                if (funct3 == 3'b000) begin
-                    result = rs1_data + imm_i;
-                    waddr = rd;
-                    wen = (rd != 0);
-                    is_jalr = 1'b0;
-                    pc_sel = 1'b0;
-                end
+            7'b0010011: begin  // I-type运算指令 (addi及移位/比较/逻辑全家)
+                waddr = rd;
+                wen = (rd != 0);
+                is_jalr = 1'b0;
+                pc_sel = 1'b0;
+                case (funct3)
+                    3'b000: result = rs1_data + imm_i;                       // addi
+                    3'b001: result = rs1_data << imm_i[4:0];                 // slli
+                    3'b010: result = ($signed(rs1_data) < $signed(imm_i)) ? 32'd1 : 32'd0; // slti
+                    3'b011: result = (rs1_data < imm_i) ? 32'd1 : 32'd0;     // sltiu
+                    3'b100: result = rs1_data ^ imm_i;                       // xori
+                    3'b101: begin // srli / srai
+                        // 注意: 不能用三目运算符合并两个分支,
+                        // 否则无符号分支会把整个表达式拖成无符号, >>>退化成>>
+                        if (imm_i[10]) begin
+                            result = $signed(rs1_data) >>> imm_i[4:0]; // srai
+                        end else begin
+                            result = rs1_data >> imm_i[4:0];           // srli
+                        end
+                    end
+                    3'b110: result = rs1_data | imm_i;                       // ori
+                    3'b111: result = rs1_data & imm_i;                       // andi
+                    default: result = 32'b0;
+                endcase
             end
-            
-            7'b0110011: begin  // R-type 指令 (add)
-                if (funct3 == 3'b000 && funct7 == 7'b0000000) begin  // add
-                    result = rs1_data + rs2_data;
-                    waddr = rd;
-                    wen = (rd != 0);
-                    is_jalr = 1'b0;
-                    pc_sel = 1'b0;
+
+            7'b0110011: begin  // R-type运算指令 (add/sub/移位/比较/逻辑 + M扩展乘除法)
+                waddr = rd;
+                wen = (rd != 0);
+                is_jalr = 1'b0;
+                pc_sel = 1'b0;
+                if (funct7 == 7'b0000000) begin
+                    case (funct3)
+                        3'b000: result = rs1_data + rs2_data;                // add
+                        3'b001: result = rs1_data << rs2_data[4:0];          // sll
+                        3'b010: result = ($signed(rs1_data) < $signed(rs2_data)) ? 32'd1 : 32'd0; // slt
+                        3'b011: result = (rs1_data < rs2_data) ? 32'd1 : 32'd0; // sltu
+                        3'b100: result = rs1_data ^ rs2_data;                // xor
+                        3'b101: result = rs1_data >> rs2_data[4:0];          // srl
+                        3'b110: result = rs1_data | rs2_data;                // or
+                        3'b111: result = rs1_data & rs2_data;                // and
+                    endcase
+                end
+                else if (funct7 == 7'b0100000) begin
+                    case (funct3)
+                        3'b000: result = rs1_data - rs2_data;                // sub
+                        3'b101: result = $signed(rs1_data) >>> rs2_data[4:0]; // sra
+                        default: result = 32'b0;
+                    endcase
+                end
+                else if (funct7 == 7'b0000001) begin  // M扩展: 乘除法指令
+                    case (funct3)
+                        3'b000: result = prod_ss[31:0];  // mul:   乘积低32位
+                        3'b001: result = prod_ss[63:32]; // mulh:  有×有, 高32位
+                        3'b010: result = prod_su[63:32]; // mulhsu:有×无, 高32位
+                        3'b011: result = prod_uu[63:32]; // mulhu: 无×无, 高32位
+                        3'b100: result = quo_s;          // div:   商
+                        3'b101: result = quo_u;          // divu:  无符号商
+                        3'b110: result = rem_s;          // rem:   余数
+                        3'b111: result = rem_u;          // remu:  无符号余数
+                    endcase
                 end
             end
             
@@ -103,9 +175,9 @@ module EXU (
                 is_store = 1'b1;
                 mem_funct3 = funct3;
                 mem_addr = rs1_data + imm_s;  // S-type立即数
-                // sb: 把最低字节移到wmask对应的那1个字节lane上; sw: 不移位
-                mem_wdata = (funct3 == 3'b000) ? (rs2_data << (8 * mem_addr[1:0]))
-                                               : rs2_data;
+                // 存储器按字节编址: sb/sh/sw都把原始数据放在低字节,
+                // 由C++侧从mem_addr起按wmask连续写入 (无需移位对齐)
+                mem_wdata = rs2_data;
                 mem_wen = 1'b1;
                 
                 waddr = 5'b0;
@@ -134,6 +206,25 @@ module EXU (
                 wen = (rd != 0);
                 is_jalr = 1'b0;
                 pc_sel = 1'b1;
+                is_load = 1'b0;
+                is_store = 1'b0;
+                mem_wen = 1'b0;
+            end
+
+            7'b1100011: begin  // 条件分支指令: 条件成立则跳转到 pc + imm_b, imm_b是b类型立即数
+                case (funct3)
+                    3'b000: br_taken = (rs1_data == rs2_data);                              // beq
+                    3'b001: br_taken = (rs1_data != rs2_data);                              // bne
+                    3'b100: br_taken = ($signed(rs1_data) <  $signed(rs2_data));            // blt
+                    3'b101: br_taken = ($signed(rs1_data) >= $signed(rs2_data));            // bge
+                    3'b110: br_taken = (rs1_data <  rs2_data);                              // bltu
+                    3'b111: br_taken = (rs1_data >= rs2_data);                              // bgeu
+                    default: br_taken = 1'b0;
+                endcase
+                if (br_taken) begin
+                    target_pc = pc + imm_b;
+                    pc_sel = 1'b1;
+                end
                 is_load = 1'b0;
                 is_store = 1'b0;
                 mem_wen = 1'b0;

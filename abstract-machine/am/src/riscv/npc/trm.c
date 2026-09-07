@@ -11,7 +11,9 @@ extern char _pmem_start;
 Area heap = RANGE(&_heap_start, PMEM_END);
 static const char mainargs[MAINARGS_MAX_LEN] = TOSTRING(MAINARGS_PLACEHOLDER); // defined in CFLAGS
 
-void putch(char ch) {
+void putch(char c) {
+  volatile char *p = (volatile char *)0x10000000ul;
+  *p = c;
 }
 
 void halt(int code) {

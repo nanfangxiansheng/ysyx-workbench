@@ -14,11 +14,10 @@
 #include <verilated.h>
 #include "svdpi.h"
 #include "VNPC.h"
+#include "difftest.h"
 
-// AM 程序链接在 0x80000000 处, 物理内存从这一地址开始编址 (类似 NEMU 的 MBASE)
-#define MBASE 0x80000000u
-#define PMEM_SIZE (128 * 1024 * 1024) // 128MB 物理内存, 与 NEMU 的 MSIZE 保持一致
-static uint8_t pmem[PMEM_SIZE] = {};
+// 物理内存 (difftest.cpp 中的参考模型REF也访问它, 故定义为全局的)
+uint8_t pmem[PMEM_SIZE] = {};
 
 static VNPC *top = nullptr;
 static bool halt_flag = false; // NPC 执行到 ebreak 后置位
@@ -29,12 +28,17 @@ static uint8_t *guest_to_host(uint32_t addr) {
   return &pmem[addr - MBASE];
 }
 
+// 地址范围检查: 4字节访问不能越过内存末尾 (支持非对齐访问)
 static bool in_pmem(uint32_t addr) {
-  return addr >= MBASE && addr - MBASE < PMEM_SIZE;
+  return addr >= MBASE && addr - MBASE <= PMEM_SIZE - 4;
 }
 
+// 从addr开始连续4个字节组装成32位小端数据
+// 约定存储器是字节编址的, 支持非对齐访问, 不再按字对齐
 static uint32_t host_read(uint32_t addr) {
-  return *(uint32_t *)guest_to_host(addr);
+  uint8_t *p = guest_to_host(addr);
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+         ((uint32_t)p[3] << 24);
 }
 
 // 越界访问只提示一次, 避免刷屏 (复位前 pc 尚未初始化, 可能产生越界的取指)
@@ -48,9 +52,9 @@ static void out_of_bound(uint32_t addr) {
 
 // ==================== DPI-C 接口 ====================
 
-// 总是读取地址为`raddr & ~0x3u`的4字节返回
+// 读取从地址`raddr`开始的4个字节 (小端序, 支持非对齐)
 extern "C" int pmem_read(int raddr) {
-  uint32_t addr = raddr & ~0x3u;
+  uint32_t addr = (uint32_t)raddr;
   if (!in_pmem(addr)) {
     out_of_bound(addr);
     return 0;
@@ -58,11 +62,18 @@ extern "C" int pmem_read(int raddr) {
   return (int)host_read(addr);
 }
 
-// 总是往地址为`waddr & ~0x3u`的4字节按写掩码`wmask`写入`wdata`
+// 从地址`waddr`开始的4个字节, 按写掩码`wmask`写入`wdata`的对应字节
 // `wmask`中每比特表示`wdata`中1个字节的掩码,
 // 如`wmask = 0x3`代表只写入最低2个字节, 内存中的其它字节保持不变
+// 字节地址连续, 因此天然支持非对齐的sw/sh
 extern "C" void pmem_write(int waddr, int wdata, char wmask) {
-  uint32_t addr = waddr & ~0x3u;
+  // UART行为模型: 往串口数据寄存器写入 = 输出一个字符
+  if ((uint32_t)waddr == UART_BASE) {
+    fputc(wdata & 0xff, stderr);
+    return;
+  }
+
+  uint32_t addr = (uint32_t)waddr;
   if (!in_pmem(addr)) {
     out_of_bound(addr);
     return;
@@ -80,9 +91,6 @@ extern "C" void ebreak(int pc) {
   halt_flag = true;
   halt_pc = (uint32_t)pc;
 }
-
-// 读取NPC寄存器堆的值 (RegisterFile.v 中通过 DPI-C export 导出)
-extern "C" int get_reg(int raddr);
 
 // ==================== 仿真框架 ====================
 
@@ -158,32 +166,44 @@ int main(int argc, char **argv) {
 
   top = new VNPC;
 
-  // C++侧直接调用DPI export函数(get_reg)前, 必须把作用域
-  // 设置到该函数所在的寄存器堆实例, Verilator才能找到它
-  svScope scope = svGetScopeFromName("TOP.NPC.regfile");
-  assert(scope != nullptr); // 层次路径不对时这里会失败
-  svSetScope(scope);
+  // 初始化DiffTest: 缓存DPI作用域, 把参考模型REF的初始状态
+  // 设置成和NPC复位后一致 (pc = MBASE, 寄存器全部为0)
+  difftest_init();
 
   reset(10);
 
-  // 不停地进行仿真, 直到程序执行 ebreak 指令为止
+  // 不停地进行仿真, 直到程序执行 ebreak 指令为止;
+  // 每执行一条指令, 都与参考模型REF对比一次状态 (DiffTest)
   uint64_t cycles = 0;
+  int diff_err = 0;
   while (!halt_flag) {
     single_cycle();
     cycles++;
+    if (difftest_step() != 0) { // NPC与REF状态不一致, 停止仿真
+      diff_err = 1;
+      break;
+    }
   }
 
-  printf("NPC: hit ebreak at PC = 0x%08x, 共执行 %llu 个周期\n", halt_pc,
-         (unsigned long long)cycles);
-
-  // 约定: 程序在执行ebreak前把结束状态写入a0(x10)
-  // 0表示程序正确结束, 非0表示程序发生错误
-  int code = get_reg(10);
-  if (code == 0) {
-    printf("NPC: HIT GOOD TRAP (a0 = 0, 程序正确结束)\n");
+  int code = 0;
+  if (diff_err) {
+    // DiffTest发现不一致: 以非0退出码结束, 让Makefile捕捉到错误
+    printf("NPC: HIT BAD TRAP (DiffTest发现执行结果不一致, 共执行 %llu 条指令)\n",
+           (unsigned long long)cycles);
+    code = 1;
   } else {
-    printf("NPC: HIT BAD TRAP at PC = 0x%08x (a0 = %d, 程序发生错误)\n",
-           halt_pc, code);
+    printf("NPC: hit ebreak at PC = 0x%08x, 共执行 %llu 个周期\n", halt_pc,
+           (unsigned long long)cycles);
+
+    // 约定: 程序在执行ebreak前把结束状态写入a0(x10)
+    // 0表示程序正确结束, 非0表示程序发生错误
+    code = difftest_read_gpr(10);
+    if (code == 0) {
+      printf("NPC: HIT GOOD TRAP (a0 = 0, 程序正确结束)\n");
+    } else {
+      printf("NPC: HIT BAD TRAP at PC = 0x%08x (a0 = %d, 程序发生错误)\n",
+             halt_pc, code);
+    }
   }
 
   top->final();
