@@ -52,10 +52,14 @@ void *malloc(size_t size) {
   // On native, malloc() will be called during initializaion of C runtime.
   // Therefore do not call panic() here, else it will yield a dead recursion:
   //   panic() -> putchar() -> (glibc) -> malloc() -> panic()
-#if !(defined(__ISA_NATIVE__) && defined(__NATIVE_USE_KLIB__))
-  panic("Not implemented");
-#endif
-  return NULL;
+  // 简单的 bump allocator: 在 AM 预留的 heap 区域上顺序分配, 不支持回收
+  static uintptr_t brk = 0;
+  if (brk == 0) brk = (uintptr_t)heap.start;
+  size = (size + sizeof(uintptr_t) - 1) & ~(uintptr_t)(sizeof(uintptr_t) - 1); // 对齐
+  if (size > (uintptr_t)heap.end - brk) return NULL;
+  void *ret = (void *)brk;
+  brk += size;
+  return ret;
 }
 
 void *calloc(size_t nmemb, size_t size) {

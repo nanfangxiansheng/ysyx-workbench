@@ -50,11 +50,40 @@ static void out_of_bound(uint32_t addr) {
   }
 }
 
+// ==================== RTC时钟行为模型 ====================
+// 返回从仿真开始所经过的时间, 单位为微秒.
+// 用宿主机的墙上时间模拟: 仿真里的1微秒 = 真实的1微秒,
+// 这样客户程序看到的时钟流速和真实世界一致
+
+#include <sys/time.h>
+
+static unsigned long long boot_us = 0; // 仿真开始时刻的墙上时间 (微秒)
+
+static unsigned long long now_us() {
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  return (unsigned long long)tv.tv_sec * 1000000ull + tv.tv_usec;
+}
+
+unsigned long long get_time() {
+  return now_us() - boot_us;
+}
 // ==================== DPI-C 接口 ====================
 
 // 读取从地址`raddr`开始的4个字节 (小端序, 支持非对齐)
 extern "C" int pmem_read(int raddr) {
   uint32_t addr = (uint32_t)raddr;
+
+  // UART行为模型: 读状态寄存器 = 查询串口是否就绪
+  // 设备速度由随机数模拟: 12.5%的概率读出1(就绪), 其余情况读出0(未就绪)
+  // 程序必须查询到就绪后才能输出字符, 否则字符会丢失
+  if (addr == UART_STAT) {
+    return (rand() & 0x7) == 0 ? 1 : 0;
+  }
+  else if (addr == RTC_ADDR)    { return get_time() & 0xffffffff; }
+  // 读出时钟的高32位
+  else if (addr == RTC_ADDR_HI) { return get_time() >> 32; }
+
   if (!in_pmem(addr)) {
     out_of_bound(addr);
     return 0;
@@ -161,6 +190,8 @@ static void load_img(int argc, char **argv) {
 
 int main(int argc, char **argv) {
   Verilated::commandArgs(argc, argv);
+
+  boot_us = now_us(); // 时钟行为模型的计时起点
 
   load_img(argc, argv);
 

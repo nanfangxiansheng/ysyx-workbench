@@ -11,9 +11,17 @@ extern char _pmem_start;
 Area heap = RANGE(&_heap_start, PMEM_END);
 static const char mainargs[MAINARGS_MAX_LEN] = TOSTRING(MAINARGS_PLACEHOLDER); // defined in CFLAGS
 
+// UART串口的寄存器地址 (内存映射I/O)
+#define UART_BASE 0x10000000ul
+#define UART_STAT (UART_BASE + 4)
+
 void putch(char c) {
-  volatile char *p = (volatile char *)0x10000000ul;
-  *p = c;
+  volatile char *stat = (volatile char *)UART_STAT;
+  volatile char *data = (volatile char *)UART_BASE;
+  // 查询状态寄存器, 直到UART就绪才输出字符, 避免字符丢失
+  while (*stat == 0)
+    ;
+  *data = c;
 }
 
 void halt(int code) {
