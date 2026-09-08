@@ -64,9 +64,11 @@ static unsigned long long now_us() {
   gettimeofday(&tv, nullptr);
   return (unsigned long long)tv.tv_sec * 1000000ull + tv.tv_usec;
 }
-
+uint64_t cycle_count=0;
 unsigned long long get_time() {
-  return now_us() - boot_us;
+  // RTC需返回微秒: 微秒 = 周期数 / 每微秒周期数(=名义主频的MHz数)
+  // 名义主频100MHz => 每100个周期是1微秒; 若按1GHz算则改成 / 1000ull
+  return cycle_count / 40ull; // 100MHz
 }
 // ==================== DPI-C 接口 ====================
 
@@ -210,6 +212,7 @@ int main(int argc, char **argv) {
   while (!halt_flag) {
     single_cycle();
     cycles++;
+    cycle_count++;
     if (difftest_step() != 0) { // NPC与REF状态不一致, 停止仿真
       diff_err = 1;
       break;
