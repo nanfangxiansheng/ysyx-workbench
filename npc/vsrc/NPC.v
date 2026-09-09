@@ -20,20 +20,27 @@ module NPC (
 
     // ============================================
     // SimpleBus: IFU与存储器(ROM)之间的取指接口
-    // 存储器是同步读的 (收到读请求后下个周期返回数据),
-    // 因此通信协议为: master每周期发地址, slave下周期回数据
+    // 存储器是同步读的 (收到读请求后下个周期返回数据).
+    // 处理器只在需要取指的拍拉高reqValid, 避免无用的请求
+    // 一直占据存储器; 存储器用respValid指示回复何时有效
     // ============================================
-    wire [31:0] ifu_raddr;   // IFU发给存储器的读地址
-    reg  [31:0] ifu_rdata;   // 存储器返回的数据 (延迟1周期)
+    wire        ifu_reqValid;  // 本拍有真正的取指请求
+    wire [31:0] ifu_raddr;     // IFU发给存储器的读地址
+    reg  [31:0] ifu_rdata;     // 存储器返回的数据 (延迟1周期)
+    reg         ifu_respValid; // 存储器的回复有效 (比reqValid晚1拍)
 
     // IFU状态机: 在不同阶段采取不同策略
-    localparam IFU_IDLE = 1'b0; // 已发出pc对应的读地址, 指令尚未返回
-    localparam IFU_WAIT = 1'b1; // ifu_rdata已返回, 是当前pc对应的有效指令
+    localparam IFU_IDLE = 1'b0; // 需要取指: 拉高reqValid发出pc, 等待回复
+    localparam IFU_WAIT = 1'b1; // respValid有效, 执行返回的指令
     reg ifu_state;
 
-    // 指令有效信号: 只有wait状态下的ifu_rdata才对应当前的pc,
-    // idle状态下总线上返回的是"上一周期"地址的数据, 不能当作指令执行
-    wire inst_valid = (ifu_state == IFU_WAIT);
+    // 只有idle状态下才有真正的取指需求: wait状态在执行指令,
+    // 此时发的请求是重取当前指令的无用请求, 白白占用存储器
+    assign ifu_reqValid = (ifu_state == IFU_IDLE);
+
+    // 指令有效信号: 处理器根据respValid判断取指回复何时有效,
+    // 只有respValid有效时ifu_rdata才是当前pc对应的指令
+    wire inst_valid = ifu_respValid;
 
     // 取指阶段: inst直接来自存储器的同步读出口
     wire [31:0] inst;
@@ -95,26 +102,34 @@ module NPC (
     assign pc_next = pc_sel ? target_pc : (pc + 4);
 
     // ============================================
-    // 取指地址: 协议要求每周期都通信, 因此两个状态下
-    // 都把pc发给存储器 (pc只在wait状态结束的时钟沿更新)
+    // 取指地址: 地址始终驱动为pc, 但存储器只在reqValid有效时
+    // 才采样它; 没有请求的拍上addr是无关值
     // ============================================
     assign ifu_raddr = pc;
 
-    // 存储器取指端口: 同步读, 时钟沿采样当前地址, 下个周期返回数据
+    // 存储器取指端口: 同步读, reqValid有效的时钟沿采样地址,
+    // 下个周期返回数据, 并用respValid指示回复有效.
+    // 注意无请求时要"保持"而不是清零ifU_rdata: load的延迟写回
+    // 依赖"写回拍时EXU译码的仍是那条load"这一事实, 若清零,
+    // EXU会译码出is_load=0, 写回握手就断了
     always @(posedge clk) begin
         if (!rst) begin
-            ifu_rdata <= pmem_read(ifu_raddr);
+            ifu_rdata     <= ifu_reqValid ? pmem_read(ifu_raddr) : ifu_rdata;
+            ifu_respValid <= ifu_reqValid;
         end
     end
 
-    // IFU状态机: idle发出请求并等待, wait执行返回的指令
+    // IFU状态机: idle发出请求并等待, wait执行返回的指令.
+    // wait状态下若respValid无效则停留等待 (当前存储器延迟固定
+    // 为1拍, respValid在wait拍恒为有效; 未来存储器延迟变化时
+    // 这个条件就是真正的等待)
     always @(posedge clk or posedge rst) begin
         if (rst) begin
             ifu_state <= IFU_IDLE;
         end else begin
             case (ifu_state)
                 IFU_IDLE: ifu_state <= IFU_WAIT; // 下个周期指令返回
-                IFU_WAIT: ifu_state <= IFU_IDLE; // 指令已执行, 取下一条
+                IFU_WAIT: ifu_state <= ifu_respValid ? IFU_IDLE : IFU_WAIT;
                 default:  ifu_state <= IFU_IDLE;
             endcase
         end
