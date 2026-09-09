@@ -69,10 +69,13 @@ module NPC (
     wire [31:0] reg_rdata1;
     wire [31:0] reg_rdata2;
 
-    // 存储器接口
-    reg  [3:0]  wmask;      // 写掩码: 每比特对应1个字节
-    reg  [31:0] mem_rdata;  // 从存储器(C++侧)读出的数据
-    wire [31:0] load_data;
+    // LSU的SimpleBus接口 (协议逻辑全部封装在LSU.v内)
+    wire        lsu_wb_en;   // load的延迟写回: 本拍应把lsu_wb_data写回寄存器堆
+    wire [31:0] lsu_wb_data;
+
+    // 指令提交信号: 非load指令在exec拍完成; load的数据晚1拍返回,
+    // 要等LSU的写回拍(inst_done由LSU的wb_en给出)才算执行完毕
+    wire inst_done = (inst_valid && !is_load) || lsu_wb_en;
 
     // ============================================
     // PC更新逻辑
@@ -120,11 +123,11 @@ module NPC (
     assign inst = ifu_rdata;
 
     // 向C++侧导出"本周期是否提交了指令", DiffTest据此决定是否对比
-    // (ifu_state在下个时钟沿就翻转了, 事后读不到, 故寄存一拍)
+    // (ifu_state/写回在下个时钟沿就翻转了, 事后读不到, 故寄存一拍)
     reg committed;
     always @(posedge clk or posedge rst) begin
         if (rst)       committed <= 1'b0;
-        else           committed <= inst_valid;
+        else           committed <= inst_done;
     end
 
     export "DPI-C" function get_committed;
@@ -186,14 +189,17 @@ module NPC (
     );
 
     // 2. 寄存器文件 (Register File)
+    // 非load指令在exec拍写回; load指令等1拍, 在LSU的写回拍写回.
+    // 写回拍时EXU译码的仍是那条load, reg_waddr恰好还是它的rd,
+    // 但load的rd=x0时reg_wen=0, 由inst_done门控天然挡掉x0写入
     RegisterFile #(
         .ADDR_WIDTH(5),
         .DATA_WIDTH(32)
     ) regfile (
         .clk   (clk),
-        .wdata (final_wdata),
+        .wdata (lsu_wb_en ? lsu_wb_data : reg_wdata),
         .waddr (reg_waddr),
-        .wen   (reg_wen && inst_valid), // idle状态下禁止写回
+        .wen   ((reg_wen && inst_valid && !is_load) || lsu_wb_en),
         .raddr1(rs1),
         .raddr2(rs2),
         .rdata1(reg_rdata1),
@@ -230,52 +236,25 @@ module NPC (
         .mem_wen   (mem_wen)
     );
 
-    // 4. 访存单元 (LSU): 负责load数据的字节选择
+    // 4. 访存单元 (LSU): SimpleBus主设备, 内含同步读写存储器端口,
+    //    负责写掩码生成/字节选择, 并把load的写回延迟1拍 (wb_en/wb_data)
     LSU lsu (
-        .addr     (mem_addr),
-        .funct3   (mem_funct3),
-        .mem_data (mem_rdata),
-        .load_data(load_data)
+        .clk       (clk),
+        .rst       (rst),
+        .exec_valid(inst_valid),
+        .is_load   (is_load),
+        .is_store  (is_store),
+        .funct3    (mem_funct3),
+        .addr      (mem_addr),
+        .wdata     (mem_wdata),
+        .wb_en     (lsu_wb_en),
+        .wb_data   (lsu_wb_data)
     );
 
     // ============================================
-    // 数据访存: 存储器由C++实现, 通过DPI-C访问
-    // 读是纯组合的; 写必须放在时钟沿触发!
-    // 若放在组合逻辑里, Verilator在clk=1的eval中更新PC后
-    // 会用新指令重新稳定组合逻辑, 导致下一条store的写
-    // "提前"一拍发出, 破坏store/load的时序可见性
+    // (数据访存已全部移入LSU.v: SimpleBus信号, 同步读写存储器
+    // 端口, 写掩码生成, load字节选择与延迟写回)
     // ============================================
-    always @(*) begin
-        // 写掩码: wmask中每比特对应wdata中1个字节
-        // 存储器按字节编址, 从mem_addr起连续写入, 天然支持非对齐访问
-        case (mem_funct3)
-            3'b010:  wmask = 4'b1111; // sw - 写入4字节
-            3'b001:  wmask = 4'b0011; // sh - 写入2字节
-            3'b000:  wmask = 4'b0001; // sb - 只写1个字节
-            default: wmask = 4'b1111;
-        endcase
-
-        if (is_load) begin
-            mem_rdata = pmem_read(mem_addr);
-        end else begin
-            mem_rdata = 0;
-        end
-    end
-
-    // 存储器写: 时钟沿触发, 与真实硬件的同步写行为一致
-    // 必须用inst_valid门控: idle状态下EXU输出的is_store是
-    // 上一条指令的残留信号, 不门控会把同一条store写两次
-    always @(posedge clk) begin
-        if (!rst && is_store && inst_valid) begin
-            pmem_write(mem_addr, mem_wdata, wmask);
-        end
-    end
-
-    // ============================================
-    // 写回数据选择: load指令写回从存储器取回的数据
-    // ============================================
-    wire [31:0] final_wdata;
-    assign final_wdata = is_load ? load_data : reg_wdata;
 
     // ============================================
     // 调试: 打印每拍状态
