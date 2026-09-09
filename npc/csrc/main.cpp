@@ -123,11 +123,19 @@ extern "C" void ebreak(int pc) {
   halt_pc = (uint32_t)pc;
 }
 
+// NPC本周期是否提交(执行)了一条指令 (difftest.cpp中封装, 内部处理DPI作用域)
+// 支持SimpleBus后NPC每2个周期才执行1条指令(1拍等待取指),
+// DiffTest只应在提交指令的那一拍与REF对比, 否则REF会跑快一倍
+
 // ==================== 仿真框架 ====================
 
 static void single_cycle() {
+  // 每半个时钟周期推进一次仿真时间, 让波形文件有时间轴
+  // (否则所有信号都堆在t=0, gtkwave里没法看)
+  top->contextp()->timeInc(1);
   top->clk = 0;
   top->eval();
+  top->contextp()->timeInc(1);
   top->clk = 1;
   top->eval();
 }
@@ -192,6 +200,7 @@ static void load_img(int argc, char **argv) {
 
 int main(int argc, char **argv) {
   Verilated::commandArgs(argc, argv);
+  Verilated::traceEverOn(true); // 允许记录波形 (WAVE=1编译时NPC.v中的$dumpvars才会生效)
 
   boot_us = now_us(); // 时钟行为模型的计时起点
 
@@ -206,16 +215,20 @@ int main(int argc, char **argv) {
   reset(10);
 
   // 不停地进行仿真, 直到程序执行 ebreak 指令为止;
-  // 每执行一条指令, 都与参考模型REF对比一次状态 (DiffTest)
+  // NPC每提交一条指令, 就与参考模型REF对比一次状态 (DiffTest)
   uint64_t cycles = 0;
+  uint64_t insts = 0;
   int diff_err = 0;
   while (!halt_flag) {
     single_cycle();
     cycles++;
     cycle_count++;
-    if (difftest_step() != 0) { // NPC与REF状态不一致, 停止仿真
-      diff_err = 1;
-      break;
+    if (npc_committed()) { // 只有真正执行了指令的这一拍才对比
+      insts++;
+      if (difftest_step() != 0) { // NPC与REF状态不一致, 停止仿真
+        diff_err = 1;
+        break;
+      }
     }
   }
 
@@ -223,11 +236,11 @@ int main(int argc, char **argv) {
   if (diff_err) {
     // DiffTest发现不一致: 以非0退出码结束, 让Makefile捕捉到错误
     printf("NPC: HIT BAD TRAP (DiffTest发现执行结果不一致, 共执行 %llu 条指令)\n",
-           (unsigned long long)cycles);
+           (unsigned long long)insts);
     code = 1;
   } else {
-    printf("NPC: hit ebreak at PC = 0x%08x, 共执行 %llu 个周期\n", halt_pc,
-           (unsigned long long)cycles);
+    printf("NPC: hit ebreak at PC = 0x%08x, 共执行 %llu 条指令 / %llu 个周期\n",
+           halt_pc, (unsigned long long)insts, (unsigned long long)cycles);
 
     // 约定: 程序在执行ebreak前把结束状态写入a0(x10)
     // 0表示程序正确结束, 非0表示程序发生错误

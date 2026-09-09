@@ -15,6 +15,12 @@ VFLAGS    = --cc --exe \
             --Mdir $(VM_DIR) \
             -Wall -Wno-fatal
 
+# WAVE=1 时记录波形到 build/npc.fst, 可用 gtkwave 查看:
+#   make sim IMG=xxx.bin WAVE=1 && gtkwave build/npc.fst
+ifdef WAVE
+VFLAGS   += --trace-fst +define+WAVE
+endif
+
 # source files (absolute paths, as Verilator generates a makefile)
 VSRC = $(shell find $(NPC_HOME)/vsrc -name "*.v")
 CSRC = $(shell find $(NPC_HOME)/csrc -name "*.c" -o -name "*.cpp" -o -name "*.cc")

@@ -18,8 +18,25 @@ module NPC (
     reg  [31:0] pc;
     wire [31:0] pc_next;
 
-    // 取指阶段
-    reg  [31:0] inst;
+    // ============================================
+    // SimpleBus: IFU与存储器(ROM)之间的取指接口
+    // 存储器是同步读的 (收到读请求后下个周期返回数据),
+    // 因此通信协议为: master每周期发地址, slave下周期回数据
+    // ============================================
+    wire [31:0] ifu_raddr;   // IFU发给存储器的读地址
+    reg  [31:0] ifu_rdata;   // 存储器返回的数据 (延迟1周期)
+
+    // IFU状态机: 在不同阶段采取不同策略
+    localparam IFU_IDLE = 1'b0; // 已发出pc对应的读地址, 指令尚未返回
+    localparam IFU_WAIT = 1'b1; // ifu_rdata已返回, 是当前pc对应的有效指令
+    reg ifu_state;
+
+    // 指令有效信号: 只有wait状态下的ifu_rdata才对应当前的pc,
+    // idle状态下总线上返回的是"上一周期"地址的数据, 不能当作指令执行
+    wire inst_valid = (ifu_state == IFU_WAIT);
+
+    // 取指阶段: inst直接来自存储器的同步读出口
+    wire [31:0] inst;
 
     // 译码阶段
     wire [6:0]  opcode;
@@ -59,11 +76,14 @@ module NPC (
 
     // ============================================
     // PC更新逻辑
+    // "不执行指令"的办法: 让处理器的状态保持不变.
+    // idle状态(inst_valid=0)下PC的写使能无效, PC保持原值,
+    // 这样ifu_raddr也就保持不变, 等到wait状态才让PC前进
     // ============================================
     always @(posedge clk or posedge rst) begin
         if (rst) begin
             pc <= 32'h8000_0000; // AM程序链接在0x80000000处, 复位后从这里开始执行
-        end else begin
+        end else if (inst_valid) begin
             pc <= pc_next;
         end
     end
@@ -72,12 +92,45 @@ module NPC (
     assign pc_next = pc_sel ? target_pc : (pc + 4);
 
     // ============================================
-    // 取指: 指令存储器由C++实现, 通过DPI-C调用
-    // pmem_read()从C++侧的物理内存中取回指令
+    // 取指地址: 协议要求每周期都通信, 因此两个状态下
+    // 都把pc发给存储器 (pc只在wait状态结束的时钟沿更新)
     // ============================================
-    always @(*) begin
-        inst = pmem_read(pc);
+    assign ifu_raddr = pc;
+
+    // 存储器取指端口: 同步读, 时钟沿采样当前地址, 下个周期返回数据
+    always @(posedge clk) begin
+        if (!rst) begin
+            ifu_rdata <= pmem_read(ifu_raddr);
+        end
     end
+
+    // IFU状态机: idle发出请求并等待, wait执行返回的指令
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            ifu_state <= IFU_IDLE;
+        end else begin
+            case (ifu_state)
+                IFU_IDLE: ifu_state <= IFU_WAIT; // 下个周期指令返回
+                IFU_WAIT: ifu_state <= IFU_IDLE; // 指令已执行, 取下一条
+                default:  ifu_state <= IFU_IDLE;
+            endcase
+        end
+    end
+
+    assign inst = ifu_rdata;
+
+    // 向C++侧导出"本周期是否提交了指令", DiffTest据此决定是否对比
+    // (ifu_state在下个时钟沿就翻转了, 事后读不到, 故寄存一拍)
+    reg committed;
+    always @(posedge clk or posedge rst) begin
+        if (rst)       committed <= 1'b0;
+        else           committed <= inst_valid;
+    end
+
+    export "DPI-C" function get_committed;
+    function int get_committed();
+        get_committed = committed;
+    endfunction
 
     // ============================================
     // DPI-C导出: C++侧读取当前PC (DiffTest逐条对比用)
@@ -91,7 +144,9 @@ module NPC (
     // ebreak: 程序执行到ebreak时, 通过DPI-C通知
     // 仿真环境结束仿真 (ebreak编码见RISC-V手册)
     // ============================================
-    wire is_ebreak = (inst == 32'h00100073);//ebreak对应的指令编码
+    // ebreak也要用inst_valid门控: 指令执行完后的idle周期里,
+    // inst仍停留在ebreak的编码上, 不门控会触发两次
+    wire is_ebreak = inst_valid && (inst == 32'h00100073);
 
     reg ebreak_printed;
     initial begin
@@ -138,7 +193,7 @@ module NPC (
         .clk   (clk),
         .wdata (final_wdata),
         .waddr (reg_waddr),
-        .wen   (reg_wen),
+        .wen   (reg_wen && inst_valid), // idle状态下禁止写回
         .raddr1(rs1),
         .raddr2(rs2),
         .rdata1(reg_rdata1),
@@ -208,8 +263,10 @@ module NPC (
     end
 
     // 存储器写: 时钟沿触发, 与真实硬件的同步写行为一致
+    // 必须用inst_valid门控: idle状态下EXU输出的is_store是
+    // 上一条指令的残留信号, 不门控会把同一条store写两次
     always @(posedge clk) begin
-        if (!rst && is_store) begin
+        if (!rst && is_store && inst_valid) begin
             pmem_write(mem_addr, mem_wdata, wmask);
         end
     end
@@ -230,6 +287,14 @@ module NPC (
     initial begin
         cycle_count = 0;
     end
+
+    // WAVE=1编译时记录波形 (Makefile: make sim WAVE=1)
+    `ifdef WAVE
+    initial begin
+        $dumpfile("build/npc.fst");
+        $dumpvars(0, NPC);
+    end
+    `endif
 
     always @(posedge clk) begin
         if (!rst) begin

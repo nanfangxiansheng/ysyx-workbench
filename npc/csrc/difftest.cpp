@@ -42,6 +42,14 @@ static uint32_t npc_read_gpr(int raddr) {
 
 int difftest_read_gpr(int raddr) { return npc_read_gpr(raddr); }
 
+// NPC.v导出的"本周期是否提交了指令" (调用前要先切作用域, 同get_pc)
+extern "C" int get_committed();
+
+int npc_committed() {
+  svSetScope(scope_npc);
+  return get_committed();
+}
+
 void difftest_init() {
   scope_npc = svGetScopeFromName("TOP.NPC");
   scope_rf = svGetScopeFromName("TOP.NPC.regfile");
@@ -54,9 +62,15 @@ void difftest_init() {
 }
 
 // ==================== REF的内存访问 (共享pmem, 小端序) ====================
+// 越界访问必须与NPC侧pmem_read/pmem_write的行为一致:
+// 读返回0, 写忽略. 否则像内置程序sw 0x12345678这类访存会让
+// REF解引用远超pmem末尾的指针直接段错误
 static uint32_t ref_load(uint32_t addr, int len) {
-  uint8_t *m = &pmem[addr - MBASE];
   uint32_t v = 0;
+  if (addr < MBASE || addr - MBASE > PMEM_SIZE - len) {
+    return 0;
+  }
+  uint8_t *m = &pmem[addr - MBASE];
   for (int i = 0; i < len; i++) {
     v |= (uint32_t)m[i] << (8 * i);
   }
@@ -64,6 +78,9 @@ static uint32_t ref_load(uint32_t addr, int len) {
 }
 
 static void ref_store(uint32_t addr, int len, uint32_t data) {
+  if (addr < MBASE || addr - MBASE > PMEM_SIZE - len) {
+    return;
+  }
   uint8_t *m = &pmem[addr - MBASE];
   for (int i = 0; i < len; i++) {
     m[i] = (data >> (8 * i)) & 0xff;

@@ -29,4 +29,7 @@ int difftest_step();
 // 读取NPC通用寄存器的值 (供main.cpp检查a0中的结束状态)
 int difftest_read_gpr(int raddr);
 
+// NPC本周期是否提交(执行)了一条指令 (供main.cpp决定DiffTest是否对比)
+int npc_committed();
+
 #endif
