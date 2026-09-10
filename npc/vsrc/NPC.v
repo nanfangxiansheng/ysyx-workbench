@@ -1,16 +1,29 @@
-// NPC.v - 顶层模块 (单周期NPC, 支持所有8条指令 + ebreak)
-// 存储器不在RTL中实现, 而是通过DPI-C交由C++仿真环境实现,
-// 这样指令和数据都可以在C++侧加载, 便于测试
+// NPC.v - 顶层模块 (多周期NPC, 支持所有8条指令 + ebreak)
+// 已按ysyxSoC的CPU接口命名规范(E阶段)暴露SimpleBus总线:
+// 存储器和外设都在SoC侧, NPC不再包含任何存储器,
+// 取指固定从0x3000_0000 (Flash)开始.
+//
+// 总线协议: reqValid拉高后必须保持, 直到respValid有效才能撤销
+// (MemBridge会把请求转成AXI, 延迟不定; 若提前撤销请求会丢失)
 module NPC (
-    input  clk,
-    input  rst
+    input         clock,
+    input         reset,          // 高电平有效
+    // IFU: 取指总线
+    output        io_ifu_reqValid,
+    output [31:0] io_ifu_addr,
+    input         io_ifu_respValid,
+    input  [31:0] io_ifu_rdata,
+    // LSU: 数据访存总线
+    output        io_lsu_reqValid,
+    output [31:0] io_lsu_addr,
+    output [1:0]  io_lsu_size,    // 访存宽度: 00=1B 01=2B 10=4B
+    output        io_lsu_wen,
+    output [31:0] io_lsu_wdata,
+    output [3:0]  io_lsu_wmask,
+    input         io_lsu_respValid,
+    input  [31:0] io_lsu_rdata
 );
 
-    // ============================================
-    // DPI-C: RTL与C++仿真环境之间的交互
-    // ============================================
-    import "DPI-C" function int  pmem_read(input int raddr);
-    import "DPI-C" function void pmem_write(input int waddr, input int wdata, input byte wmask);
     // NPC执行ebreak时, 通过该函数通知仿真环境结束仿真 (顺便把PC告诉C++侧)
     import "DPI-C" function void ebreak(input int pc);
 
@@ -18,34 +31,21 @@ module NPC (
     reg  [31:0] pc;
     wire [31:0] pc_next;
 
-    // ============================================
-    // SimpleBus: IFU与存储器(ROM)之间的取指接口
-    // 存储器是同步读的 (收到读请求后下个周期返回数据).
-    // 处理器只在需要取指的拍拉高reqValid, 避免无用的请求
-    // 一直占据存储器; 存储器用respValid指示回复何时有效
-    // ============================================
-    wire        ifu_reqValid;  // 本拍有真正的取指请求
-    wire [31:0] ifu_raddr;     // IFU发给存储器的读地址
-    reg  [31:0] ifu_rdata;     // 存储器返回的数据 (延迟1周期)
-    reg         ifu_respValid; // 存储器的回复有效 (比reqValid晚1拍)
+    // 主控状态机:
+    // S_FETCH: 发出取指请求(io_ifu_reqValid=1)并保持, 等到respValid
+    // S_WAIT : 执行指令; 若是load/store, 发出访存请求并保持,
+    //          等到io_lsu_respValid的那一拍完成写回/提交
+    localparam S_FETCH = 1'b0;
+    localparam S_WAIT  = 1'b1;
+    reg state;
 
-    // IFU状态机: 在不同阶段采取不同策略
-    localparam IFU_IDLE = 1'b0; // 需要取指: 拉高reqValid发出pc, 等待回复
-    localparam IFU_WAIT = 1'b1; // respValid有效, 执行返回的指令
-    reg ifu_state;
+    wire in_fetch = (state == S_FETCH);
+    wire in_wait  = (state == S_WAIT);
 
-    // 只有idle状态下才有真正的取指需求: wait状态在执行指令,
-    // 此时发的请求是重取当前指令的无用请求, 白白占用存储器
-    assign ifu_reqValid = (ifu_state == IFU_IDLE);
-
-    // 指令有效信号: 处理器根据respValid判断取指回复何时有效,
-    // 只有respValid有效时ifu_rdata才是当前pc对应的指令
-    wire inst_valid = ifu_respValid;
-
-    // 取指阶段: inst直接来自存储器的同步读出口
+    wire inst_valid = in_wait;
     wire [31:0] inst;
 
-    // 译码阶段
+    // 译码阶段 (IDU输出)
     wire [6:0]  opcode;
     wire [4:0]  rd;
     wire [2:0]  funct3;
@@ -58,7 +58,7 @@ module NPC (
     wire [31:0] imm_j;
     wire [31:0] imm_b;
 
-    // 执行阶段
+    // 执行阶段 (EXU输出)
     wire [4:0]  reg_waddr;
     wire [31:0] reg_wdata;
     wire        reg_wen;
@@ -76,24 +76,61 @@ module NPC (
     wire [31:0] reg_rdata1;
     wire [31:0] reg_rdata2;
 
-    // LSU的SimpleBus接口 (协议逻辑全部封装在LSU.v内)
-    wire        lsu_wb_en;   // load的延迟写回: 本拍应把lsu_wb_data写回寄存器堆
-    wire [31:0] lsu_wb_data;
-
-    // 指令提交信号: 非load指令在exec拍完成; load的数据晚1拍返回,
-    // 要等LSU的写回拍(inst_done由LSU的wb_en给出)才算执行完毕
-    wire inst_done = (inst_valid && !is_load) || lsu_wb_en;
+    // load数据 (LSU字节选择/扩展后)
+    wire [31:0] load_data;
 
     // ============================================
-    // PC更新逻辑
-    // "不执行指令"的办法: 让处理器的状态保持不变.
-    // idle状态(inst_valid=0)下PC的写使能无效, PC保持原值,
-    // 这样ifu_raddr也就保持不变, 等到wait状态才让PC前进
+    // IFU总线: 取指地址驱动为pc, reqValid在整个取指期间保持,
+    // 收到respValid的那一拍指令有效, 进入执行状态
     // ============================================
-    always @(posedge clk or posedge rst) begin
-        if (rst) begin
-            pc <= 32'h8000_0000; // AM程序链接在0x80000000处, 复位后从这里开始执行
-        end else if (inst_valid) begin
+    assign io_ifu_reqValid = in_fetch;
+    assign io_ifu_addr     = pc;
+    assign inst            = io_ifu_rdata;
+
+    // ============================================
+    // LSU总线: 仅load/store的执行拍发起请求并保持,
+    // 直到respValid; size由访存宽度决定(funct3低2位恰好是编码)
+    // ============================================
+    wire is_mem = is_load || is_store;
+
+    assign io_lsu_reqValid = in_wait && is_mem && !io_lsu_respValid;
+    assign io_lsu_addr     = mem_addr;
+    assign io_lsu_size     = mem_funct3[1:0]; // 000->00(1B) 001->01(2B) 010->10(4B)
+    assign io_lsu_wen      = io_lsu_reqValid && is_store;
+    // 子字写的数据和掩码必须放到地址对应的字节通道上 (AXI约定):
+    // 例如sb写地址0x10000003时, 数据要出现在wdata[31:24]、
+    // wmask应为4'b1000, APB外设按paddr[1:0]挑选字节通道
+    assign io_lsu_wdata    = mem_wdata << (8 * mem_addr[1:0]);
+    assign io_lsu_wmask    = wmask << mem_addr[1:0];
+
+    // 子字读同理: 设备(Flash/PSRAM)返回的是对齐字的字,
+    // 请求地址的低2位被截掉, 因此CPU要按addr[1:0]旋转提取
+    wire [31:0] lsu_rdata_aligned = io_lsu_rdata >> (8 * mem_addr[1:0]);
+
+    // 写掩码: 每比特对应wdata中1个字节, 存储器按字节编址,
+    // 从addr起连续写入, 天然支持非对齐访问
+    reg [3:0] wmask;
+    always @(*) begin
+        case (mem_funct3)
+            3'b010:  wmask = 4'b1111; // sw - 写入4字节
+            3'b001:  wmask = 4'b0011; // sh - 写入2字节
+            3'b000:  wmask = 4'b0001; // sb - 只写1个字节
+            default: wmask = 4'b1111;
+        endcase
+    end
+    assign io_lsu_wmask = wmask;
+
+    // 指令提交信号: 非访存指令在exec拍完成; 访存指令要等
+    // 存储器respValid的那一拍才完成(load在该拍写回)
+    wire inst_done = in_wait && (!is_mem || io_lsu_respValid);
+
+    // ============================================
+    // PC更新逻辑: 只在指令完成的那一拍前进, 其余拍保持不变
+    // ============================================
+    always @(posedge clock or posedge reset) begin
+        if (reset) begin
+            pc <= 32'h3000_0000; // ysyxSoC: 复位后从Flash取指令
+        end else if (inst_done) begin
             pc <= pc_next;
         end
     end
@@ -101,47 +138,24 @@ module NPC (
     // PC选择
     assign pc_next = pc_sel ? target_pc : (pc + 4);
 
-    // ============================================
-    // 取指地址: 地址始终驱动为pc, 但存储器只在reqValid有效时
-    // 才采样它; 没有请求的拍上addr是无关值
-    // ============================================
-    assign ifu_raddr = pc;
-
-    // 存储器取指端口: 同步读, reqValid有效的时钟沿采样地址,
-    // 下个周期返回数据, 并用respValid指示回复有效.
-    // 注意无请求时要"保持"而不是清零ifU_rdata: load的延迟写回
-    // 依赖"写回拍时EXU译码的仍是那条load"这一事实, 若清零,
-    // EXU会译码出is_load=0, 写回握手就断了
-    always @(posedge clk) begin
-        if (!rst) begin
-            ifu_rdata     <= ifu_reqValid ? pmem_read(ifu_raddr) : ifu_rdata;
-            ifu_respValid <= ifu_reqValid;
-        end
-    end
-
-    // IFU状态机: idle发出请求并等待, wait执行返回的指令.
-    // wait状态下若respValid无效则停留等待 (当前存储器延迟固定
-    // 为1拍, respValid在wait拍恒为有效; 未来存储器延迟变化时
-    // 这个条件就是真正的等待)
-    always @(posedge clk or posedge rst) begin
-        if (rst) begin
-            ifu_state <= IFU_IDLE;
+    // 主控状态机: 两个状态下都"respValid无效则停留等待"
+    always @(posedge clock or posedge reset) begin
+        if (reset) begin
+            state <= S_FETCH;
         end else begin
-            case (ifu_state)
-                IFU_IDLE: ifu_state <= IFU_WAIT; // 下个周期指令返回
-                IFU_WAIT: ifu_state <= ifu_respValid ? IFU_IDLE : IFU_WAIT;
-                default:  ifu_state <= IFU_IDLE;
+            case (state)
+                S_FETCH: state <= io_ifu_respValid ? S_WAIT : S_FETCH;
+                S_WAIT:  state <= inst_done        ? S_FETCH : S_WAIT;
+                default: state <= S_FETCH;
             endcase
         end
     end
 
-    assign inst = ifu_rdata;
-
     // 向C++侧导出"本周期是否提交了指令", DiffTest据此决定是否对比
-    // (ifu_state/写回在下个时钟沿就翻转了, 事后读不到, 故寄存一拍)
+    // (state在下个时钟沿就翻转了, 事后读不到, 故寄存一拍)
     reg committed;
-    always @(posedge clk or posedge rst) begin
-        if (rst)       committed <= 1'b0;
+    always @(posedge clock or posedge reset) begin
+        if (reset)     committed <= 1'b0;
         else           committed <= inst_done;
     end
 
@@ -159,11 +173,8 @@ module NPC (
     endfunction
 
     // ============================================
-    // ebreak: 程序执行到ebreak时, 通过DPI-C通知
-    // 仿真环境结束仿真 (ebreak编码见RISC-V手册)
+    // ebreak: 程序执行到ebreak时, 通过DPI-C通知仿真环境结束
     // ============================================
-    // ebreak也要用inst_valid门控: 指令执行完后的idle周期里,
-    // inst仍停留在ebreak的编码上, 不门控会触发两次
     wire is_ebreak = inst_valid && (inst == 32'h00100073);
 
     reg ebreak_printed;
@@ -204,17 +215,16 @@ module NPC (
     );
 
     // 2. 寄存器文件 (Register File)
-    // 非load指令在exec拍写回; load指令等1拍, 在LSU的写回拍写回.
-    // 写回拍时EXU译码的仍是那条load, reg_waddr恰好还是它的rd,
-    // 但load的rd=x0时reg_wen=0, 由inst_done门控天然挡掉x0写入
+    // 只在指令完成的拍写回: 非访存指令在exec拍, load在respValid拍
+    // (该拍EXU译码的仍是那条load, reg_waddr/reg_wdata恰好正确)
     RegisterFile #(
         .ADDR_WIDTH(5),
         .DATA_WIDTH(32)
     ) regfile (
-        .clk   (clk),
-        .wdata (lsu_wb_en ? lsu_wb_data : reg_wdata),
+        .clk   (clock),
+        .wdata (is_load ? load_data : reg_wdata),
         .waddr (reg_waddr),
-        .wen   ((reg_wen && inst_valid && !is_load) || lsu_wb_en),
+        .wen   (reg_wen && inst_done),
         .raddr1(rs1),
         .raddr2(rs2),
         .rdata1(reg_rdata1),
@@ -251,63 +261,21 @@ module NPC (
         .mem_wen   (mem_wen)
     );
 
-    // 4. 访存单元 (LSU): SimpleBus主设备, 内含同步读写存储器端口,
-    //    负责写掩码生成/字节选择, 并把load的写回延迟1拍 (wb_en/wb_data)
+    // 4. 访存单元 (LSU): 负责load数据的字节选择/扩展
     LSU lsu (
-        .clk       (clk),
-        .rst       (rst),
-        .exec_valid(inst_valid),
-        .is_load   (is_load),
-        .is_store  (is_store),
-        .funct3    (mem_funct3),
-        .addr      (mem_addr),
-        .wdata     (mem_wdata),
-        .wb_en     (lsu_wb_en),
-        .wb_data   (lsu_wb_data)
+        .funct3   (mem_funct3),
+        .mem_data (lsu_rdata_aligned),
+        .load_data(load_data)
     );
 
     // ============================================
-    // (数据访存已全部移入LSU.v: SimpleBus信号, 同步读写存储器
-    // 端口, 写掩码生成, load字节选择与延迟写回)
+    // 调试: WAVE=1编译时记录波形 (Makefile: make sim WAVE=1)
     // ============================================
-
-    // ============================================
-    // 调试: 打印每拍状态
-    // 仿真的结束不再依赖固定周期数, 而是由程序
-    // 中的ebreak指令决定
-    // ============================================
-    integer cycle_count;
-
-    initial begin
-        cycle_count = 0;
-    end
-
-    // WAVE=1编译时记录波形 (Makefile: make sim WAVE=1)
     `ifdef WAVE
     initial begin
         $dumpfile("build/npc.fst");
         $dumpvars(0, NPC);
     end
     `endif
-
-    always @(posedge clk) begin
-        if (!rst) begin
-            cycle_count <= cycle_count + 1;
-            // $display("----------------------------------------");
-            // $display("Cycle %0d: PC = 0x%08X, inst = 0x%08X", cycle_count, pc, inst);
-            // //regfile.print_regs();
-
-            // if (is_load) begin
-            //     $display("  *** LOAD: addr = 0x%08X, funct3 = %b", mem_addr, mem_funct3);
-            // end
-            // if (is_store) begin
-            //     $display("  *** STORE: addr = 0x%08X, data = 0x%08X, wmask = %b",
-            //              mem_addr, mem_wdata, wmask);
-            // end
-            // if (is_jalr) begin
-            //     $display("  *** JALR: 跳转到 0x%08X", target_pc);
-            // end
-        end
-    end
 
 endmodule

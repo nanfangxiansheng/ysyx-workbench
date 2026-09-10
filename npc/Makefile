@@ -4,9 +4,14 @@ OBJ_DIR   = $(NPC_HOME)/build
 BIN       = $(OBJ_DIR)/$(NAME)
 
 # top module of your design
-VTOP      ?= NPC
+# 接入ysyxSoC后, 仿真顶层为SimTop (NPC作为其中的处理器核)
+VTOP      ?= SimTop
 
-# Verilator
+# ysyxSoC相关路径 (ysyxSoC位于workbench根目录, 与npc/平级)
+YSYX_SOC  = $(NPC_HOME)/../ysyxSoC
+SOC_ELAB  = $(YSYX_SOC)/ready-to-run/minirv/ElaborateTop.v
+PERIP_VSRC = $(shell find $(YSYX_SOC)/perip -name "*.v" -o -name "*.sv")
+
 VERILATOR = verilator
 VM_DIR    = $(OBJ_DIR)/obj_dir
 VM_BIN    = $(VM_DIR)/V$(VTOP)
@@ -15,8 +20,14 @@ VFLAGS    = --cc --exe \
             --Mdir $(VM_DIR) \
             -Wall -Wno-fatal
 
+# ysyxSoC外设RTL所需的编译选项与include搜索路径
+# (uart16550/spi的RTL中使用了include的宏定义文件)
+VFLAGS   += --timescale "1ns/1ns" --no-timing
+VFLAGS   += -D__VERILOG__ -DPDK_BEHAV -D__UART_TO_CONSOLE__
+VFLAGS   += -I$(YSYX_SOC)/perip/uart16550/rtl -I$(YSYX_SOC)/perip/spi/rtl
+
 # WAVE=1 时记录波形到 build/npc.fst, 可用 gtkwave 查看:
-#   make sim IMG=xxx.bin WAVE=1 && gtkwave build/npc.fst
+#   make sim WAVE=1 && gtkwave build/npc.fst
 ifdef WAVE
 VFLAGS   += --trace-fst +define+WAVE
 endif
@@ -29,14 +40,15 @@ CSRC = $(shell find $(NPC_HOME)/csrc -name "*.c" -o -name "*.cpp" -o -name "*.cc
 
 all: $(BIN)
 
-$(BIN): $(VSRC) $(CSRC)
+$(BIN): $(VSRC) $(PERIP_VSRC) $(SOC_ELAB) $(CSRC)
 	@mkdir -p $(VM_DIR)
-	$(VERILATOR) $(VFLAGS) $(VSRC) $(CSRC)
+	$(VERILATOR) $(VFLAGS) $(VSRC) $(PERIP_VSRC) $(SOC_ELAB) $(CSRC)
 	$(MAKE) -C $(VM_DIR) -f V$(VTOP).mk
 	@cp $(VM_BIN) $(BIN)
 
 # 运行仿真时加载的镜像文件, 例如:
-#   make sim IMG=$(YSYX_HOME)/am-kernels/tests/cpu-tests/build/dummy-riscv32-nemu.bin
+#   make sim IMG=$(YSYX_SOC)/ready-to-run/minirv/hello-minirv-ysyxsoc.bin
+# 镜像会被读入仿真侧的Flash, NPC从Flash中启动
 IMG ?=
 
 sim: $(BIN)
