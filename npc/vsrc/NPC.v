@@ -57,6 +57,11 @@ module NPC (
     wire [31:0] imm_s;
     wire [31:0] imm_j;
     wire [31:0] imm_b;
+    wire [11:0] csr_addr;
+
+    // CSR单元接口
+    wire [31:0] csr_rdata;
+    wire        csr_wen_raw; // EXU输出的"本指令是csrrs"原始信号
 
     // 执行阶段 (EXU输出)
     wire [4:0]  reg_waddr;
@@ -151,6 +156,25 @@ module NPC (
         end
     end
 
+    // ============================================
+    // IPC统计: 分别累计取指/执行阶段周期数和提交指令数,
+    // ebreak时打印 (IPC = n_inst / (n_fetch + n_wait))
+    // ============================================
+    reg [31:0] n_fetch, n_wait, n_inst;
+    always @(posedge clock or posedge reset) begin
+        if (reset) begin
+            n_fetch <= 0;
+            n_wait  <= 0;
+        end else begin
+            n_fetch <= n_fetch + in_fetch;
+            n_wait  <= n_wait  + in_wait;
+        end
+    end
+    always @(posedge clock) begin
+        if (reset)          n_inst <= 0;
+        else if (inst_done) n_inst <= n_inst + 1;
+    end
+
     // 向C++侧导出"本周期是否提交了指令", DiffTest据此决定是否对比
     // (state在下个时钟沿就翻转了, 事后读不到, 故寄存一拍)
     reg committed;
@@ -188,6 +212,8 @@ module NPC (
             ebreak(pc);  // 通知C++仿真环境结束仿真
             $display("\n========================================");
             $display("NPC: 遇到ebreak指令, 仿真结束!");
+            $display("IPC统计: 共提交%0d条指令, 取指%0d周期 + 执行%0d周期 = %0d周期, IPC = %.3f",
+                     n_inst, n_fetch, n_wait, n_fetch + n_wait, n_inst / (n_fetch + n_wait + 1.0));
             $display("最终寄存器状态:");
             regfile.print_final_regs();
             $display("========================================");
@@ -211,7 +237,8 @@ module NPC (
         .imm_u   (imm_u),
         .imm_s   (imm_s),
         .imm_j   (imm_j),
-        .imm_b   (imm_b)
+        .imm_b   (imm_b),
+        .csr     (csr_addr)
     );
 
     // 2. 寄存器文件 (Register File)
@@ -247,6 +274,8 @@ module NPC (
         .rd        (rd),
         .rs1       (rs1),
         .rs2       (rs2),
+        .csr_addr  (csr_addr),
+        .csr_rdata (csr_rdata),
         .result    (reg_wdata),
         .waddr     (reg_waddr),
         .wen       (reg_wen),
@@ -258,7 +287,22 @@ module NPC (
         .mem_funct3(mem_funct3),
         .mem_addr  (mem_addr),
         .mem_wdata (mem_wdata),
-        .mem_wen   (mem_wen)
+        .mem_wen   (mem_wen),
+        .is_csr    (csr_wen_raw)
+    );
+
+    // 5. 控制状态寄存器 (CSR)
+    // csrrs的写入条件: 是csrrs指令且rs1!=x0 (规范约定rs1=x0时只读不写,
+    // 这正是csrr伪指令的展开形式), 与寄存器堆一样在指令完成拍写入,
+    // 保证"读旧值"和"写入"在同一拍原子地完成
+    wire csr_wen = csr_wen_raw && (rs1 != 5'b0) && inst_done;
+    CSR csr_unit (
+        .clock (clock),
+        .reset (reset),
+        .addr  (csr_addr),
+        .wen   (csr_wen),
+        .wdata (reg_rdata1),
+        .rdata (csr_rdata)
     );
 
     // 4. 访存单元 (LSU): 负责load数据的字节选择/扩展
@@ -275,6 +319,12 @@ module NPC (
     initial begin
         $dumpfile("build/npc.fst");
         $dumpvars(0, NPC);
+    end
+    // 只转储前20万个周期, 避免长仿真的波形文件过大 (观察单条指令足够了)
+    reg [31:0] wave_cycles;
+    always @(posedge clock) begin
+        wave_cycles <= wave_cycles + 1;
+        if (wave_cycles == 32'd200000) $dumpoff;
     end
     `endif
 

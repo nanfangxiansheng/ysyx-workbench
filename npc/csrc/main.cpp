@@ -17,6 +17,11 @@
 #include "VSimTop.h"
 #include "svdpi.h"
 #include "difftest.h"
+#include <nvboard.h>
+
+// auto_bind.cpp (由constr/npc.nxdc经auto_pin_bind.py生成):
+// 把SimTop的引脚绑定到NVBoard的串口终端等部件
+extern void nvboard_bind_all_pins(VSimTop *top);
 
 // difftest.cpp引用的物理内存 (暂未使用, 保留符号以便链接)
 uint8_t pmem[PMEM_SIZE] = {};
@@ -100,10 +105,20 @@ int main(int argc, char **argv) {
 
   top = new VSimTop;
 
+  // 必须先绑定引脚再初始化NVBoard:
+  // nvboard_init()构造UART组件时会缓存pin_array中的引脚指针,
+  // 若之后才nvboard_bind_pin, 组件读到的还是旧指针, 串口终端收不到任何数据
+  nvboard_bind_all_pins(top);
+
+  // 初始化NVBoard虚拟开发板(串口终端等部件在此创建)
+  nvboard_init();
+  // UART的RX线空闲电平为高; 之后由NVBoard驱动(在串口终端中敲键即有输入),
+  // 复位期间RX为0会被UART当成起始位
+  top->externalPins_uart0_rx = 1;
+
   // 当前不关心其他端口, 给固定值
   top->coreSel = 0;
   top->externalPins_mygpio_in = 0;
-  top->externalPins_uart0_rx = 0;
 
   // 把镜像读入Flash, NPC复位后将从Flash中取出第一条指令
   if (argc < 2) {
@@ -119,6 +134,7 @@ int main(int argc, char **argv) {
   uint64_t cycles = 0;
   while (!halt_flag) {
     single_cycle();
+    nvboard_update(); // 每个仿真周期刷新一次虚拟外设(内部有按帧节流)
     cycles++;
     if (cycles > 2000000000ull) { // 防止无限仿真
       printf("NPC: 超过20亿周期仍未停机, 强制结束\n");
@@ -136,5 +152,6 @@ int main(int argc, char **argv) {
 
   top->final();
   delete top;
+  nvboard_quit(); // 关闭NVBoard窗口
   return code;
 }

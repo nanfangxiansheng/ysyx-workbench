@@ -11,9 +11,10 @@ module IDU (
     output [31:0] imm_u,
     output [31:0] imm_s,
     output [31:0] imm_j,
-    output [31:0] imm_b
+    output [31:0] imm_b,
+    output [11:0] csr      // CSR指令的CSR地址 (inst[31:20], 即I-type立即数低12位)
 );
-    
+
     // 指令字段提取
     assign opcode = inst[6:0];
     assign rd     = inst[11:7];
@@ -21,6 +22,7 @@ module IDU (
     assign rs1    = inst[19:15];
     assign rs2    = inst[24:20];
     assign funct7 = inst[31:25];
+    assign csr    = inst[31:20];
     
     // I-type立即数（带符号扩展）
     assign imm_i = {{20{inst[31]}}, inst[31:20]};

@@ -14,6 +14,8 @@ module EXU (
     input  [4:0]  rd,
     input  [4:0]  rs1,
     input  [4:0]  rs2,
+    input  [11:0] csr_addr,
+    input  [31:0] csr_rdata,  // CSR单元按csr_addr读出的旧值
     output reg [31:0] result,
     output reg [4:0]  waddr,
     output reg        wen,
@@ -25,7 +27,8 @@ module EXU (
     output reg [2:0]  mem_funct3,
     output reg [31:0] mem_addr,
     output reg [31:0] mem_wdata,
-    output reg        mem_wen
+    output reg        mem_wen,
+    output reg        is_csr   // 本指令是csrrs: NPC据此在指令完成拍写CSR
 );
 
     // ============================================
@@ -72,6 +75,7 @@ module EXU (
         mem_addr = 32'b0;
         mem_wdata = 32'b0;
         mem_wen = 1'b0;
+        is_csr = 1'b0;
         
         case (opcode)
             7'b0010011: begin  // I-type运算指令 (addi及移位/比较/逻辑全家)
@@ -230,6 +234,19 @@ module EXU (
                 mem_wen = 1'b0;
             end
             
+            7'b1110011: begin  // SYSTEM指令: 目前只实现csrrs (funct3=010)
+                if (funct3 == 3'b010) begin
+                    // csrrs rd, csr, rs1: 原子地 rd = CSR旧值, CSR |= rs1
+                    // 写回旧值在组合逻辑中完成, CSR写入由NPC在指令完成拍进行,
+                    // 因此rd拿到的必然是写入前的旧值
+                    result = csr_rdata;
+                    waddr = rd;
+                    wen = (rd != 0);
+                    is_csr = 1'b1;
+                end
+                // 其余SYSTEM指令 (csrrw/csrrc/ecall等) 按"未知指令"处理
+            end
+
             default: begin
                 // 未知指令
                 result = 32'b0;

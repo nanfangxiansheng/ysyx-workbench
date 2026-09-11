@@ -1,21 +1,37 @@
 #include <am.h>
 
-// RTC实时时钟寄存器: 两次32位读拼出64位的微秒数 (内存映射I/O)
-#define RTC_ADDR    0x20000000u
-#define RTC_ADDR_HI (RTC_ADDR + 4u)
-/*
-u 是整数字面量的后缀，表示这个常量的类型是 unsigned int（无符号），而不是默认的 int。*/
+// NPC没有RTC设备, 时钟源用mcycle/mcycleh (64位周期计数器, 每周期+1).
+// 时间 = 周期数 / 频率. 将来在真实芯片上运行时, 把此值改成处理器的
+// 实际工作频率(Hz)并重新编译即可; 仿真环境中没有频率概念, 该值按
+// 仿真的墙钟速率校准(实测约35万周期/秒), 使程序读到的时钟接近真实时间.
+#define SIM_CPU_FREQ_HZ 80000  // 实测本机独占运行约8万周期/秒
+
+static uint32_t read_mcycle() {
+  uint32_t val;
+  asm volatile("csrr %0, mcycle" : "=r"(val));
+  return val;
+}
+
+static uint32_t read_mcycleh() {
+  uint32_t val;
+  asm volatile("csrr %0, mcycleh" : "=r"(val));
+  return val;
+}
+
 void __am_timer_init() {
 }
 
 void __am_timer_uptime(AM_TIMER_UPTIME_T *uptime) {
-  volatile uint32_t *rtc_lo = (volatile uint32_t *)RTC_ADDR;
-  volatile uint32_t *rtc_hi = (volatile uint32_t *)RTC_ADDR_HI;
-  // 先读高32位再读低32位: 若两者之间低32位恰好溢出,
-  // 读到的只是"过去"的时间, 不会出现时间倒退
-  uint32_t hi = *rtc_hi;
-  uint32_t lo = *rtc_lo;
-  uptime->us = ((uint64_t)hi << 32) | lo;
+  // 64位计数器跨两次CSR读取: 先读hi, 再读lo, 最后重读hi.
+  // 两次hi不一致说明期间低32位恰好进位, 重试即可 (标准的高-低-高读法)
+  uint32_t hi, lo;
+  do {
+    hi = read_mcycleh();
+    lo = read_mcycle();
+  } while (hi != read_mcycleh());
+
+  // 先乘1e6再除, 避免整除截断 (周期数×1e6在64位下不会溢出)
+  uptime->us = (((uint64_t)hi << 32) | lo) * 1000000ull / SIM_CPU_FREQ_HZ;
 }
 
 void __am_timer_rtc(AM_TIMER_RTC_T *rtc) {
