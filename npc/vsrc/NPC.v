@@ -1,7 +1,8 @@
 // NPC.v - 顶层模块 (多周期NPC, 支持所有8条指令 + ebreak)
 // 已按ysyxSoC的CPU接口命名规范(E阶段)暴露SimpleBus总线:
-// 存储器和外设都在SoC侧, NPC不再包含任何存储器,
-// 取指固定从0x3000_0000 (Flash)开始.
+// 存储器和外设都不在NPC中, 访存一律通过总线请求完成.
+// 集成ysyxSoC时取指从0x3000_0000 (Flash)开始,
+// 单独仿真时从0x8000_0000 (pmem)开始, 由Makefile的SIM模式决定 (见RESET_PC).
 //
 // 总线协议: reqValid拉高后必须保持, 直到respValid有效才能撤销
 // (MemBridge会把请求转成AXI, 延迟不定; 若提前撤销请求会丢失)
@@ -132,9 +133,15 @@ module NPC (
     // ============================================
     // PC更新逻辑: 只在指令完成的那一拍前进, 其余拍保持不变
     // ============================================
+    // 复位PC由仿真模式决定 (Makefile在集成ysyxSoC时定义宏SOC):
+    `ifdef SOC
+    localparam RESET_PC = 32'h3000_0000; // 集成ysyxSoC: 复位后从Flash取指令
+    `else
+    localparam RESET_PC = 32'h8000_0000; // 单独仿真NPC: 复位后从pmem取指令
+    `endif
     always @(posedge clock or posedge reset) begin
         if (reset) begin
-            pc <= 32'h3000_0000; // ysyxSoC: 复位后从Flash取指令
+            pc <= RESET_PC;
         end else if (inst_done) begin
             pc <= pc_next;
         end
